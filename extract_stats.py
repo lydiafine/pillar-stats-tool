@@ -7,7 +7,10 @@ in 2024") as well as numbers attached to a stats keyword even with no
 year in the same sentence (e.g. "median pay is $106,950").
 
 Usage:
-    python extract_stats.py <urls.txt | urls_dir> output.xlsx
+    python extract_stats.py <urls.txt | urls_dir> [output.xlsx]
+
+Output defaults to "Pillar Stat Review - <Mon DD YYYY>.xlsx" (today's date)
+in the current directory if no output path is given.
 
 If given a single file: one article URL per line (blank lines and lines
 starting with # are ignored), treated as one unnamed pillar.
@@ -263,12 +266,18 @@ def gather_pillar_url_lists(input_path):
     return [(pillar_name_from_filename(path), load_urls(path))]
 
 
+def default_output_path():
+    return f"Pillar Stat Review - {date.today():%b %d %Y}.xlsx"
+
+
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python extract_stats.py <urls.txt | urls_dir> output.xlsx")
+    if len(sys.argv) not in (2, 3):
+        print("Usage: python extract_stats.py <urls.txt | urls_dir> [output.xlsx]")
+        print(f"  (output defaults to '{default_output_path()}' if omitted)")
         sys.exit(1)
 
-    input_path, out_path = sys.argv[1], sys.argv[2]
+    input_path = sys.argv[1]
+    out_path = sys.argv[2] if len(sys.argv) == 3 else default_output_path()
     pillar_url_lists = gather_pillar_url_lists(input_path)
 
     wb = Workbook()
