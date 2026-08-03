@@ -397,7 +397,7 @@ def write_stat_group(ws, pillar_name, row):
     each with a real clickable hyperlink), then merges every other column
     vertically across those rows so the group still reads as one entry.
     Returns True if this stat is likely stale."""
-    stat_name = guess_stat_name(row["quote"], row["stat_type"], row["block_type"])
+    stat_name = row["stat_name"]
     staleness = assess_staleness(row["source"], row["years"])
     shared = [pillar_name, stat_name, row["block_type"], row["quote"],
               row["years"], row["source"], row["stat_type"],
@@ -461,6 +461,14 @@ def main():
             time.sleep(0.5)  # be polite to the server
 
         deduped = dedupe_across_articles(pillar_rows)
+        for row in deduped:
+            row["stat_name"] = guess_stat_name(row["quote"], row["stat_type"], row["block_type"])
+        # Sort (stable) so rows sharing a stat name are always contiguous --
+        # e.g. two distinct "Wage (US)" facts should sit next to each other
+        # rather than being separated by an unrelated table row, so Lydia
+        # can eyeball and manually merge them together if she wants to.
+        deduped.sort(key=lambda r: r["stat_name"].lower())
+
         total_flagged += len(deduped)
         for row in deduped:
             if write_stat_group(ws, pillar_name, row):
