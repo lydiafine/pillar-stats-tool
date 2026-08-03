@@ -35,8 +35,21 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 from openpyxl import Workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
+
+HYPERLINK_FONT = Font(color="0563C1", underline="single")
+TOP_ALIGN = Alignment(vertical="top", wrap_text=True)
+
+# Column layout for the "Flagged stats" sheet. ARTICLE_COL holds one
+# clickable hyperlink per row (one cell = one hyperlink, an Excel
+# limitation); every other column is merged vertically across a stat's
+# rows so a multi-article stat still reads as one grouped block.
+SHEET_HEADER = ["Pillar", "SUMMARY", "Article", "Block Type", "Quote / Context",
+                "Detected Year(s)", "Apparent Source", "Stat Type",
+                "Suggested Cadence", "Staleness Assessment"]
+ARTICLE_COL = 3
+MERGE_COLS = [c for c in range(1, len(SHEET_HEADER) + 1) if c != ARTICLE_COL]
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (pillar-stats-extractor)"}
 
@@ -379,6 +392,35 @@ def dedupe_across_articles(pillar_rows):
     return [by_key[key] for key in order]
 
 
+def write_stat_group(ws, pillar_name, row):
+    """Writes one deduped stat as N rows (one per article it appears in,
+    each with a real clickable hyperlink), then merges every other column
+    vertically across those rows so the group still reads as one entry.
+    Returns True if this stat is likely stale."""
+    stat_name = guess_stat_name(row["quote"], row["stat_type"], row["block_type"])
+    staleness = assess_staleness(row["source"], row["years"])
+    shared = [pillar_name, stat_name, row["block_type"], row["quote"],
+              row["years"], row["source"], row["stat_type"],
+              suggested_cadence(row["source"]), staleness]
+
+    start_row = ws.max_row + 1
+    for title, url in row["locations"]:
+        ws.append(shared[:2] + [title] + shared[2:])
+        r = ws.max_row
+        link_cell = ws.cell(row=r, column=ARTICLE_COL)
+        link_cell.hyperlink = url
+        link_cell.font = HYPERLINK_FONT
+        for col in range(1, len(SHEET_HEADER) + 1):
+            ws.cell(row=r, column=col).alignment = TOP_ALIGN
+
+    end_row = ws.max_row
+    if end_row > start_row:
+        for col in MERGE_COLS:
+            ws.merge_cells(start_row=start_row, start_column=col, end_row=end_row, end_column=col)
+
+    return staleness.startswith("Likely stale")
+
+
 def main():
     if len(sys.argv) not in (2, 3):
         print("Usage: python extract_stats.py <urls.txt | urls_dir> [output.xlsx]")
@@ -392,11 +434,8 @@ def main():
     wb = Workbook()
     ws = wb.active
     ws.title = "Flagged stats"
-    header = ["Pillar", "SUMMARY", "Found In", "Block Type", "Quote / Context",
-              "Detected Year(s)", "Apparent Source", "Stat Type", "Suggested Cadence",
-              "Staleness Assessment"]
-    ws.append(header)
-    for col in range(1, len(header) + 1):
+    ws.append(SHEET_HEADER)
+    for col in range(1, len(SHEET_HEADER) + 1):
         ws.cell(row=1, column=col).font = Font(bold=True)
 
     total_flagged = 0
@@ -411,6 +450,8 @@ def main():
             except Exception as exc:
                 print(f"  ERROR: {exc}")
                 ws.append([pillar_name, "", url, "ERROR", str(exc), "", "", "", "", ""])
+                ws.cell(row=ws.max_row, column=ARTICLE_COL).hyperlink = url
+                ws.cell(row=ws.max_row, column=ARTICLE_COL).font = HYPERLINK_FONT
                 continue
 
             print(f"  {len(rows)} flagged stat(s)")
@@ -422,18 +463,10 @@ def main():
         deduped = dedupe_across_articles(pillar_rows)
         total_flagged += len(deduped)
         for row in deduped:
-            staleness = assess_staleness(row["source"], row["years"])
-            if staleness.startswith("Likely stale"):
+            if write_stat_group(ws, pillar_name, row):
                 total_stale += 1
-            found_in = "; ".join(f"{t} ({u})" for t, u in row["locations"])
-            stat_name = guess_stat_name(row["quote"], row["stat_type"], row["block_type"])
-            ws.append([
-                pillar_name, stat_name, found_in, row["block_type"], row["quote"],
-                row["years"], row["source"], row["stat_type"],
-                suggested_cadence(row["source"]), staleness,
-            ])
 
-    widths = [20, 32, 45, 10, 55, 14, 22, 14, 16, 45]
+    widths = [20, 32, 40, 10, 55, 14, 22, 14, 16, 45]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
