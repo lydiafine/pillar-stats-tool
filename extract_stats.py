@@ -194,13 +194,49 @@ US_STATES = [
 ]
 
 
-def guess_stat_name(quote, stat_type, block_type):
+def describe_table(table_tag):
+    """Pulls the table's <caption> and its <thead> column names, e.g.
+    ("Salary ranges for biomedical engineers throughout the United
+    States", ["Geography", "10th Percentile", "Median", "90th Percentile"])
+    -- built from the actual table structure rather than the flattened
+    " | "-joined text, since a header cell's own internal markup (e.g.
+    "10th"<br/>"Percentile" split across nested <span> tags) would
+    otherwise get mis-split into separate tokens by a plain text split."""
+    caption_tag = table_tag.find("caption")
+    caption = caption_tag.get_text(" ", strip=True) if caption_tag else None
+
+    header_row = None
+    thead = table_tag.find("thead")
+    if thead:
+        header_row = thead.find("tr")
+    if header_row is None:
+        header_row = table_tag.find("tr")
+
+    headers = ([c.get_text(" ", strip=True) for c in header_row.find_all(["th", "td"])]
+               if header_row else [])
+    return caption, headers
+
+
+def guess_table_name(table_tag):
+    caption, headers = describe_table(table_tag)
+    name = caption or (headers[0] if headers else "Data table")
+    # First column is usually the row-label dimension (Geography,
+    # Institution, ...), not a measured figure -- the remaining columns are
+    # what you'd actually need to go look up, e.g. "10th Percentile, Median,
+    # 90th Percentile".
+    metrics = headers[1:] if len(headers) > 1 else []
+    if metrics:
+        name += ": " + ", ".join(metrics)
+    return name
+
+
+def guess_stat_name(row):
     """Best-effort short label for the stat -- a starting point to hand-edit,
     not a substitute for human review."""
-    if block_type == "Table":
-        header = quote.split(" | ")[0].strip()
-        return header or "Data table"
+    if row["block_type"] == "Table":
+        return row.get("_stat_name_hint") or "Data table"
 
+    quote, stat_type = row["quote"], row["stat_type"]
     geography = None
     if re.search(r"United States|\bU\.S\.", quote):
         geography = "US"
@@ -293,6 +329,7 @@ def fetch_article(url):
                 "source": guess_source(context_text),
                 "stat_type": guess_stat_type(context_text),
                 "_merge_key": merge_key,
+                "_stat_name_hint": guess_table_name(block),
             })
             continue
 
@@ -462,7 +499,7 @@ def main():
 
         deduped = dedupe_across_articles(pillar_rows)
         for row in deduped:
-            row["stat_name"] = guess_stat_name(row["quote"], row["stat_type"], row["block_type"])
+            row["stat_name"] = guess_stat_name(row)
         # Sort (stable) so rows sharing a stat name are always contiguous --
         # e.g. two distinct "Wage (US)" facts should sit next to each other
         # rather than being separated by an unrelated table row, so Lydia
