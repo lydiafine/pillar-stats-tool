@@ -71,7 +71,26 @@ STAT_KEYWORD_RE = re.compile(
     re.I,
 )
 
+# Lead-in sentences that introduce a table/stat rather than citing one
+# themselves, e.g. "Below you'll find the top 10 colleges...". These get
+# flagged as false positives if they happen to mention a threshold number
+# ("20,000 total enrollment") near a stats keyword ("tuition").
+INTRO_PHRASE_RE = re.compile(
+    r"below you.ll find|you.ll find the|here are the|the following table"
+    r"|the table below|as shown below|see the table",
+    re.I,
+)
+
 NOISE_CLASS_HINTS = ("breadcrumb", "webform", "menu", "nav")
+SOURCE_LINE_RE = re.compile(r"Source\s*:.*?[.!?]", re.I)
+
+# Periods inside these should not be treated as sentence boundaries.
+_PROTECTED_ABBREVIATIONS = [
+    "U.S.A.", "U.S.", "U.K.", "Ph.D.", "M.D.", "vs.", "etc.",
+    "approx.", "Dr.", "Mr.", "Ms.", "Mrs.", "Jr.", "Sr.", "St.",
+    "Inc.", "Ltd.", "Co.",
+]
+_ABBREV_PLACEHOLDER = "․"  # one dot leader -- visually a period, not matched by [.!?]
 
 
 def guess_source(text):
@@ -141,7 +160,45 @@ def is_noise(el):
 
 
 def split_sentences(text):
-    return re.split(r"(?<=[.!?])\s+", text)
+    protected = text
+    for abbr in _PROTECTED_ABBREVIATIONS:
+        protected = protected.replace(abbr, abbr.replace(".", _ABBREV_PLACEHOLDER))
+    parts = re.split(r"(?<=[.!?])\s+", protected)
+    return [p.replace(_ABBREV_PLACEHOLDER, ".") for p in parts]
+
+
+US_STATES = [
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+    "Connecticut", "Delaware", "Florida", "Georgia", "Hawaii", "Idaho",
+    "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana",
+    "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+    "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+    "New Hampshire", "New Jersey", "New Mexico", "New York",
+    "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon",
+    "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota",
+    "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington",
+    "West Virginia", "Wisconsin", "Wyoming",
+]
+
+
+def guess_stat_name(quote, stat_type, block_type):
+    """Best-effort short label for the stat -- a starting point to hand-edit,
+    not a substitute for human review."""
+    if block_type == "Table":
+        header = quote.split(" | ")[0].strip()
+        return header or "Data table"
+
+    geography = None
+    if re.search(r"United States|\bU\.S\.", quote):
+        geography = "US"
+    else:
+        for state in US_STATES:
+            if re.search(rf"\b{re.escape(state)}\b", quote):
+                geography = state
+                break
+
+    base = stat_type if stat_type != "Other" else "Stat"
+    return f"{base} ({geography})" if geography else base
 
 
 def find_main_content(soup):
@@ -211,12 +268,18 @@ def fetch_article(url):
             if len(quote) > 300:
                 quote = quote[:300] + "..."
 
+            tail = context_text[len(table_text):]
+            source_line_match = SOURCE_LINE_RE.search(tail)
+            merge_key = (source_line_match.group(0).strip().lower()
+                         if source_line_match else (tail or None))
+
             rows.append({
                 "block_type": "Table",
                 "quote": quote,
                 "years": ", ".join(years),
                 "source": guess_source(context_text),
                 "stat_type": guess_stat_type(context_text),
+                "_merge_key": merge_key,
             })
             continue
 
@@ -225,6 +288,8 @@ def fetch_article(url):
             continue
 
         for sentence in split_sentences(text):
+            if INTRO_PHRASE_RE.search(sentence):
+                continue
             has_number = NUMBER_RE.search(sentence)
             has_year = YEAR_RE.search(sentence)
             if has_number and (has_year or STAT_KEYWORD_RE.search(sentence)):
@@ -236,9 +301,28 @@ def fetch_article(url):
                     "years": ", ".join(years),
                     "source": guess_source(sentence),
                     "stat_type": guess_stat_type(sentence),
+                    "_merge_key": None,
                 })
 
-    return title, rows
+    return title, merge_sibling_tables(rows)
+
+
+def merge_sibling_tables(rows):
+    """Adjacent Table rows that share the same trailing source/caption text
+    (e.g. two tables both captioned "Source: IPEDS, 2023-24 completions...")
+    are presenting one dataset split across tables for display -- collapse
+    them into a single row."""
+    merged = []
+    for row in rows:
+        key = row.get("_merge_key")
+        if (key and merged and merged[-1].get("block_type") == "Table"
+                and merged[-1].get("_merge_key") == key):
+            merged[-1]["quote"] += " /// " + row["quote"]
+        else:
+            merged.append(row)
+    for row in merged:
+        row.pop("_merge_key", None)
+    return merged
 
 
 def load_urls(path):
@@ -270,6 +354,31 @@ def default_output_path():
     return f"Pillar Stat Review - {date.today():%b %d %Y}.xlsx"
 
 
+def stat_fingerprint(row):
+    """Identifies "the same stat" by its actual numbers/year/source/type
+    rather than exact quote text, since the same figure often gets
+    paraphrased slightly between articles (e.g. "the U.S." vs "the United
+    States", "Bureau of Labor Statistics" vs "U.S. Bureau of Labor
+    Statistics") -- exact-text matching alone would miss those as dupes."""
+    numbers = tuple(sorted(m.group(0).strip() for m in NUMBER_RE.finditer(row["quote"])))
+    return (row["block_type"], row["source"], row["stat_type"], row["years"], numbers)
+
+
+def dedupe_across_articles(pillar_rows):
+    """pillar_rows: list of (row_dict, title, url). Collapses rows that are
+    the same underlying stat (same fingerprint) cited in multiple articles
+    into one row with all locations combined."""
+    by_key = {}
+    order = []
+    for row, title, url in pillar_rows:
+        key = stat_fingerprint(row)
+        if key not in by_key:
+            by_key[key] = {**row, "locations": []}
+            order.append(key)
+        by_key[key]["locations"].append((title, url))
+    return [by_key[key] for key in order]
+
+
 def main():
     if len(sys.argv) not in (2, 3):
         print("Usage: python extract_stats.py <urls.txt | urls_dir> [output.xlsx]")
@@ -283,7 +392,7 @@ def main():
     wb = Workbook()
     ws = wb.active
     ws.title = "Flagged stats"
-    header = ["Pillar", "Article Title", "URL", "Block Type", "Quote / Context",
+    header = ["Pillar", "SUMMARY", "Found In", "Block Type", "Quote / Context",
               "Detected Year(s)", "Apparent Source", "Stat Type", "Suggested Cadence",
               "Staleness Assessment"]
     ws.append(header)
@@ -294,37 +403,44 @@ def main():
     total_stale = 0
     for pillar_name, urls in pillar_url_lists:
         print(f"=== Pillar: {pillar_name} ({len(urls)} article(s)) ===")
+        pillar_rows = []
         for i, url in enumerate(urls, 1):
             print(f"[{i}/{len(urls)}] Fetching {url}")
             try:
                 title, rows = fetch_article(url)
             except Exception as exc:
                 print(f"  ERROR: {exc}")
-                ws.append([pillar_name, url, url, "ERROR", str(exc), "", "", "", "", ""])
+                ws.append([pillar_name, "", url, "ERROR", str(exc), "", "", "", "", ""])
                 continue
 
             print(f"  {len(rows)} flagged stat(s)")
-            total_flagged += len(rows)
             for row in rows:
-                staleness = assess_staleness(row["source"], row["years"])
-                if staleness.startswith("Likely stale"):
-                    total_stale += 1
-                ws.append([
-                    pillar_name, title, url, row["block_type"], row["quote"],
-                    row["years"], row["source"], row["stat_type"],
-                    suggested_cadence(row["source"]), staleness,
-                ])
+                pillar_rows.append((row, title, url))
 
             time.sleep(0.5)  # be polite to the server
 
-    widths = [20, 30, 40, 10, 55, 14, 22, 14, 16, 45]
+        deduped = dedupe_across_articles(pillar_rows)
+        total_flagged += len(deduped)
+        for row in deduped:
+            staleness = assess_staleness(row["source"], row["years"])
+            if staleness.startswith("Likely stale"):
+                total_stale += 1
+            found_in = "; ".join(f"{t} ({u})" for t, u in row["locations"])
+            stat_name = guess_stat_name(row["quote"], row["stat_type"], row["block_type"])
+            ws.append([
+                pillar_name, stat_name, found_in, row["block_type"], row["quote"],
+                row["years"], row["source"], row["stat_type"],
+                suggested_cadence(row["source"]), staleness,
+            ])
+
+    widths = [20, 32, 45, 10, 55, 14, 22, 14, 16, 45]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
 
     wb.save(out_path)
     total_articles = sum(len(urls) for _, urls in pillar_url_lists)
-    print(f"\nDone. {total_flagged} stat(s) flagged across {total_articles} article(s) "
+    print(f"\nDone. {total_flagged} unique stat(s) flagged across {total_articles} article(s) "
           f"in {len(pillar_url_lists)} pillar(s).")
     print(f"{total_stale} flagged as likely stale.")
     print(f"Saved to {out_path}")
