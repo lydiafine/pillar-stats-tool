@@ -71,8 +71,13 @@ SOURCE_PATTERNS = [
 STAT_TYPE_PATTERNS = [
     ("Wage", re.compile(r"salary|salaries|wage|pay\b|earn|income", re.I)),
     ("Outlook", re.compile(r"outlook|growth|demand|projected|job growth|decline", re.I)),
-    ("Enrollment", re.compile(r"enroll|completions?|graduates?", re.I)),
+    # Checked before Enrollment: IPEDS methodology boilerplate almost always
+    # says "...degree completions in X..." to describe how institutions were
+    # selected/ranked, even when the actual displayed figures are costs --
+    # without this ordering that boilerplate wins over the real "tuition"/
+    # "cost" keyword every time.
     ("Cost/Tuition", re.compile(r"tuition|cost\b|price", re.I)),
+    ("Enrollment", re.compile(r"enroll|completions?|graduates?", re.I)),
     ("Ranking", re.compile(r"rank(ed|ing)?|top \d", re.I)),
 ]
 
@@ -233,8 +238,8 @@ def guess_table_name(table_tag):
 def guess_stat_name(row):
     """Best-effort short label for the stat -- a starting point to hand-edit,
     not a substitute for human review."""
-    if row["block_type"] == "Table":
-        return row.get("_stat_name_hint") or "Data table"
+    if row["block_type"] in ("Table", "StatWidget"):
+        return row.get("_stat_name_hint") or "Statistic"
 
     quote, stat_type = row["quote"], row["stat_type"]
     geography = None
@@ -255,6 +260,123 @@ def find_main_content(soup):
     if article:
         return article
     return soup.find("main") or soup.find("body")
+
+
+def find_trailing_context(start_el, max_hops=3, max_climbs=3):
+    """Walks forward through siblings -- climbing out of wrapper divs
+    (e.g. div.table-responsive, a layout column with no sibling of its
+    own) when a level runs out of siblings -- collecting text until a
+    "Source: ..." line is found or the hop/climb budget runs out."""
+    context = ""
+    node = start_el
+    hops = 0
+    climbs = 0
+    while hops < max_hops:
+        nxt = node.find_next_sibling()
+        if nxt is None:
+            if climbs < max_climbs and node.parent is not None and node.parent.name in ("div", "section"):
+                node = node.parent
+                climbs += 1
+                continue
+            break
+        nxt_text = nxt.get_text(" ", strip=True)
+        if nxt_text:
+            context += " || " + nxt_text
+            if re.search(r"source\s*:", nxt_text, re.I):
+                break
+        node = nxt
+        hops += 1
+    return context
+
+
+def extract_stat_widgets(content):
+    """Some pages use a "statistic callout" component instead of a table:
+    a div.stat__grid per number, with the figure in h2.stat__title (often
+    split across a "$" prefix span and a digits span) and its caption in a
+    sibling p.stat__content, e.g.:
+
+        <div class="stat stat__grid">
+          <div><h2 class="stat__title">
+            <span class="headline__prefix">$</span>
+            <span class="headline__heading">13,131</span>
+          </h2></div>
+          <p class="stat__content">Public, in-state college/university</p>
+        </div>
+
+    Multiple such boxes sitting in the same layout row (e.g. a 3-column
+    row) are grouped into one flagged entry, same as a multi-column table."""
+    groups = {}
+    order = []
+    for grid in content.find_all("div", class_="stat__grid"):
+        h2 = grid.find("h2", class_="stat__title")
+        if h2 is None:
+            continue
+
+        # Each box in a multi-column row (e.g. 3 side-by-side columns) can
+        # be wrapped in its own per-column layout div at a different depth,
+        # so matching on a "layout--*" ancestor class picks a different,
+        # unshared wrapper per box. The nearest preceding non-widget H2 is
+        # the section heading introducing this row -- a far more reliable
+        # signal that boxes belong together than DOM-ancestor guessing.
+        # (Not using class_=<lambda> here: BS4 calls a class_ function once
+        # per individual class token, not with the tag's full class list --
+        # so a negative check like "stat__title not in classes" can match
+        # on an unrelated second class token and pick up another stat box.)
+        heading_tag = next(
+            (h for h in grid.find_all_previous("h2")
+             if "stat__title" not in (h.get("class") or [])),
+            None,
+        )
+        key = id(heading_tag) if heading_tag is not None else id(grid)
+        if key not in groups:
+            groups[key] = {"heading": heading_tag, "boxes": []}
+            order.append(key)
+        groups[key]["anchor"] = grid  # keep advancing to the last box seen in this group
+
+        number = h2.get_text(strip=True)  # no separator -- avoids inserting
+                                           # a space between "$" and digits
+                                           # that live in separate spans
+        caption_tag = grid.find("p", class_="stat__content")
+        caption = caption_tag.get_text(" ", strip=True) if caption_tag else ""
+        groups[key]["boxes"].append((number, caption))
+
+    rows = []
+    for key in order:
+        boxes = groups[key]["boxes"]
+        if not boxes:
+            continue
+        anchor = groups[key]["anchor"]
+        quote = "; ".join(f"{cap}: {num}" if cap else num for num, cap in boxes)
+
+        # The trailing "Source: ..." line's own optional methodology
+        # sentence isn't reliably present (some pages include it, some
+        # don't), which made years/classification unstable across
+        # duplicate copies of "the same" widget on different articles.
+        # Anchor on the more stable signals instead: the short Source
+        # sentence alone for the year, and the section heading that
+        # actually introduces this widget (e.g. "How much does it cost to
+        # study biomedical engineering in the US?") for classification.
+        trailing = find_trailing_context(anchor)
+        source_line_match = SOURCE_LINE_RE.search(trailing)
+        source_line = source_line_match.group(0) if source_line_match else trailing
+        years = sorted(set(m.group(0) for m in YEAR_RE.finditer(source_line)))
+
+        heading_tag = groups[key]["heading"]
+        heading = heading_tag.get_text(" ", strip=True) if heading_tag else ""
+        classify_text = f"{quote} {heading} {source_line}"
+
+        stat_name_hint = " | ".join(cap for _, cap in boxes if cap) or "Statistic"
+
+        rows.append({
+            "block_type": "StatWidget",
+            "quote": quote,
+            "years": ", ".join(years),
+            "source": guess_source(classify_text),
+            "stat_type": guess_stat_type(classify_text),
+            "_merge_key": None,
+            "_stat_name_hint": stat_name_hint,
+        })
+    return rows
 
 
 def fetch_article(url):
@@ -286,28 +408,7 @@ def fetch_article(url):
             seen_tables.add(id(block))
 
             table_text = block.get_text(" | ", strip=True)
-
-            context_text = table_text
-            node = block
-            hops = 0
-            climbs = 0
-            while hops < 3:
-                nxt = node.find_next_sibling()
-                if nxt is None:
-                    # table may be wrapped in a layout div (e.g. div.table-responsive)
-                    # with no sibling of its own; climb one level and retry.
-                    if climbs < 2 and node.parent is not None and node.parent.name in ("div", "section"):
-                        node = node.parent
-                        climbs += 1
-                        continue
-                    break
-                nxt_text = nxt.get_text(" ", strip=True)
-                if nxt_text:
-                    context_text += " || " + nxt_text
-                    if re.search(r"source\s*:", nxt_text, re.I):
-                        break
-                node = nxt
-                hops += 1
+            context_text = table_text + find_trailing_context(block)
 
             years = sorted(set(m.group(0) for m in YEAR_RE.finditer(context_text)))
             if not years and not STAT_KEYWORD_RE.search(context_text) and not NUMBER_RE.search(context_text):
@@ -354,6 +455,7 @@ def fetch_article(url):
                     "_merge_key": None,
                 })
 
+    rows.extend(extract_stat_widgets(content))
     return title, merge_sibling_tables(rows)
 
 
