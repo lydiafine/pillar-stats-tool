@@ -66,6 +66,7 @@ SOURCE_PATTERNS = [
     ("U.S. News & World Report", re.compile(r"U\.?S\.? News", re.I)),
     ("Niche", re.compile(r"\bNiche\b")),
     ("PayScale", re.compile(r"PayScale", re.I)),
+    ("College Scorecard", re.compile(r"College Scorecard", re.I)),
 ]
 
 STAT_TYPE_PATTERNS = [
@@ -149,8 +150,14 @@ def latest_ipeds_completions_year(today=None):
 
 
 def assess_staleness(source_label, years_str, today=None):
-    if source_label not in ("BLS", "IPEDS"):
+    if source_label == "Unknown (needs review)":
         return "Source unclear — manual check"
+    if source_label not in ("BLS", "IPEDS"):
+        # A real, named source (College Scorecard, Niche, PayScale, ...) --
+        # just one we don't have a release-cadence heuristic for yet, which
+        # is a different (and much better) situation than not knowing the
+        # source at all.
+        return f"{source_label} cited — no automated freshness check yet, verify manually"
     if not years_str:
         return "No year found — manual check"
 
