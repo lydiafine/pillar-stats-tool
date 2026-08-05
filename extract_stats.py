@@ -184,12 +184,27 @@ def is_noise(el):
     return any(hint in ident for hint in NOISE_CLASS_HINTS)
 
 
-def split_sentences(text):
+def protect_abbreviation_periods(text):
     protected = text
     for abbr in _PROTECTED_ABBREVIATIONS:
         protected = protected.replace(abbr, abbr.replace(".", _ABBREV_PLACEHOLDER))
-    parts = re.split(r"(?<=[.!?])\s+", protected)
+    return protected
+
+
+def split_sentences(text):
+    parts = re.split(r"(?<=[.!?])\s+", protect_abbreviation_periods(text))
     return [p.replace(_ABBREV_PLACEHOLDER, ".") for p in parts]
+
+
+def find_source_sentence(text):
+    """Isolates just the "Source: ..." sentence out of a longer blob of
+    text. Abbreviation periods (e.g. "U.S." in "Source: U.S. Bureau of
+    Labor Statistics") are protected first -- SOURCE_LINE_RE's lazy match
+    otherwise stops at the first period it finds, which without this would
+    truncate that example down to just "Source: U.", losing the actual
+    source name entirely."""
+    match = SOURCE_LINE_RE.search(protect_abbreviation_periods(text))
+    return match.group(0).replace(_ABBREV_PLACEHOLDER, ".") if match else None
 
 
 US_STATES = [
@@ -229,6 +244,19 @@ def describe_table(table_tag):
     return caption, headers
 
 
+def table_to_readable_text(table_tag):
+    """Renders a table as one line per row (caption first, if any) instead
+    of a single flattened " | "-joined wall of text -- with wrap_text on,
+    Excel then shows it as an actual readable mini-table inside the cell."""
+    caption, _ = describe_table(table_tag)
+    lines = [caption] if caption else []
+    for tr in table_tag.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+        if cells:
+            lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+
 def guess_table_name(table_tag):
     caption, headers = describe_table(table_tag)
     name = caption or (headers[0] if headers else "Data table")
@@ -242,11 +270,28 @@ def guess_table_name(table_tag):
     return name
 
 
+def shorten_name(name, max_len=90):
+    """Hard length cap for the SUMMARY column -- a multi-caption stat
+    widget or a wide table can otherwise join enough column names/captions
+    to produce a genuinely long string. Cuts at the last comma/pipe/colon
+    boundary within the limit so it reads as "X, Y, Z (+N more)" rather
+    than an arbitrary mid-word chop."""
+    if len(name) <= max_len:
+        return name
+    truncated = name[:max_len]
+    for sep in (", ", " | ", ": "):
+        idx = truncated.rfind(sep)
+        if idx > max_len * 0.4:
+            return truncated[:idx] + "..."
+    idx = truncated.rfind(" ")
+    return (truncated[:idx] if idx > 0 else truncated) + "..."
+
+
 def guess_stat_name(row):
     """Best-effort short label for the stat -- a starting point to hand-edit,
     not a substitute for human review."""
     if row["block_type"] in ("Table", "StatWidget"):
-        return row.get("_stat_name_hint") or "Statistic"
+        return shorten_name(row.get("_stat_name_hint") or "Statistic")
 
     quote, stat_type = row["quote"], row["stat_type"]
     geography = None
@@ -343,8 +388,14 @@ def extract_stat_widgets(content):
         number = h2.get_text(strip=True)  # no separator -- avoids inserting
                                            # a space between "$" and digits
                                            # that live in separate spans
-        caption_tag = grid.find("p", class_="stat__content")
-        caption = caption_tag.get_text(" ", strip=True) if caption_tag else ""
+        # Caption can be split across an optional "description" span (e.g.
+        # "Estimated growth rate") and the "content" paragraph (e.g. "for
+        # biomedical engineering jobs from 2024 to 2034...") -- grab both.
+        description_tag = grid.find("span", class_="stat__description")
+        content_tag = grid.find("p", class_="stat__content")
+        caption = " ".join(
+            t.get_text(" ", strip=True) for t in (description_tag, content_tag) if t
+        )
         groups[key]["boxes"].append((number, caption))
 
     rows = []
@@ -353,7 +404,7 @@ def extract_stat_widgets(content):
         if not boxes:
             continue
         anchor = groups[key]["anchor"]
-        quote = "; ".join(f"{cap}: {num}" if cap else num for num, cap in boxes)
+        quote = "\n".join(f"{cap}: {num}" if cap else num for num, cap in boxes)
 
         # The trailing "Source: ..." line's own optional methodology
         # sentence isn't reliably present (some pages include it, some
@@ -364,9 +415,8 @@ def extract_stat_widgets(content):
         # actually introduces this widget (e.g. "How much does it cost to
         # study biomedical engineering in the US?") for classification.
         trailing = find_trailing_context(anchor)
-        source_line_match = SOURCE_LINE_RE.search(trailing)
-        source_line = source_line_match.group(0) if source_line_match else trailing
-        years = sorted(set(m.group(0) for m in YEAR_RE.finditer(source_line)))
+        source_line = find_source_sentence(trailing) or trailing
+        years = sorted(set(m.group(0) for m in YEAR_RE.finditer(f"{quote} {source_line}")))
 
         heading_tag = groups[key]["heading"]
         heading = heading_tag.get_text(" ", strip=True) if heading_tag else ""
@@ -414,7 +464,7 @@ def fetch_article(url):
                 continue
             seen_tables.add(id(block))
 
-            table_text = block.get_text(" | ", strip=True)
+            table_text = table_to_readable_text(block)
             context_text = table_text + find_trailing_context(block)
 
             years = sorted(set(m.group(0) for m in YEAR_RE.finditer(context_text)))
@@ -422,13 +472,10 @@ def fetch_article(url):
                 continue
 
             quote = table_text
-            if len(quote) > 300:
-                quote = quote[:300] + "..."
 
             tail = context_text[len(table_text):]
-            source_line_match = SOURCE_LINE_RE.search(tail)
-            merge_key = (source_line_match.group(0).strip().lower()
-                         if source_line_match else (tail or None))
+            source_sentence = find_source_sentence(tail)
+            merge_key = source_sentence.strip().lower() if source_sentence else (tail or None)
 
             rows.append({
                 "block_type": "Table",
@@ -476,7 +523,7 @@ def merge_sibling_tables(rows):
         key = row.get("_merge_key")
         if (key and merged and merged[-1].get("block_type") == "Table"
                 and merged[-1].get("_merge_key") == key):
-            merged[-1]["quote"] += " /// " + row["quote"]
+            merged[-1]["quote"] += "\n\n" + row["quote"]
         else:
             merged.append(row)
     for row in merged:
@@ -514,19 +561,23 @@ def default_output_path():
 
 
 def stat_fingerprint(row):
-    """Identifies "the same stat" by its actual numbers/year/source/type
-    rather than exact quote text, since the same figure often gets
-    paraphrased slightly between articles (e.g. "the U.S." vs "the United
-    States", "Bureau of Labor Statistics" vs "U.S. Bureau of Labor
-    Statistics") -- exact-text matching alone would miss those as dupes."""
+    """Identifies "the same stat" by its actual numbers/year rather than
+    exact quote text (which often gets paraphrased slightly between
+    articles -- "the U.S." vs "the United States", "between 2024 and 2034"
+    vs "from 2024 to 2034") or by source/stat_type (a page that reuses a
+    widget/table sometimes drops its "Source: ..." citation entirely, which
+    would otherwise fingerprint the same real stat differently depending on
+    which article happened to still include it)."""
     numbers = tuple(sorted(m.group(0).strip() for m in NUMBER_RE.finditer(row["quote"])))
-    return (row["block_type"], row["source"], row["stat_type"], row["years"], numbers)
+    return (row["block_type"], row["years"], numbers)
 
 
 def dedupe_across_articles(pillar_rows):
     """pillar_rows: list of (row_dict, title, url). Collapses rows that are
     the same underlying stat (same fingerprint) cited in multiple articles
-    into one row with all locations combined."""
+    into one row with all locations combined. If one occurrence has a real
+    source/stat_type and another (of the same underlying stat) doesn't,
+    the group upgrades to the more informative one."""
     by_key = {}
     order = []
     for row, title, url in pillar_rows:
@@ -534,6 +585,10 @@ def dedupe_across_articles(pillar_rows):
         if key not in by_key:
             by_key[key] = {**row, "locations": []}
             order.append(key)
+        elif (by_key[key]["source"] == "Unknown (needs review)"
+              and row["source"] != "Unknown (needs review)"):
+            by_key[key]["source"] = row["source"]
+            by_key[key]["stat_type"] = row["stat_type"]
         by_key[key]["locations"].append((title, url))
     return [by_key[key] for key in order]
 
