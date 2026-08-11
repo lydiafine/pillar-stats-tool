@@ -1,0 +1,13 @@
+{
+  "_source": "BME Statistics for Pillar Articles.docx -- BLS OEWS, published May 2024",
+  "soc_code": "17-2031",
+  "values": {
+    "U.S.": {"10th_pctile": 71860, "median": 106950, "90th_pctile": 165160},
+    "California": {"10th_pctile": 83990, "median": 125700, "90th_pctile": 173630},
+    "Massachusetts": {"10th_pctile": 80700, "median": 107720, "90th_pctile": 163430},
+    "Minnesota": {"10th_pctile": 83440, "median": 124760, "90th_pctile": 184510},
+    "Ohio": {"10th_pctile": 79140, "median": 117960, "90th_pctile": 165570},
+    "Texas": {"10th_pctile": 54840, "median": 97160, "90th_pctile": 151330},
+    "Washington": {"10th_pctile": 64510, "median": 125010, "90th_pctile": 182250}
+  }
+}

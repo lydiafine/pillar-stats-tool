@@ -10,8 +10,17 @@ you (or the pillar's methodology doc) decide, not something this script
 guesses at.
 
 Usage:
-    python fetch_bls_wages.py <SOC-code> <states-comma-separated> [output.xlsx]
-    python fetch_bls_wages.py 17-2031 "California,Massachusetts,Minnesota,Ohio,Texas,Washington" "BME Wage Data.xlsx"
+    python fetch_bls_wages.py <SOC-code> <states-comma-separated> [output.xlsx] [--baseline=path.json]
+    python fetch_bls_wages.py 17-2031 "California,Massachusetts,Minnesota,Ohio,Texas,Washington" "BME Wage Data.xlsx" --baseline=reference/bme_wage_baseline_2024.json
+
+--baseline points at a JSON file shaped like:
+    {"values": {"U.S.": {"10th_pctile": 71860, "median": 106950, "90th_pctile": 165160}, ...}}
+When given, the output gets a Baseline Median / % Change (Median) / Review
+column -- so you don't have to go dig up prior numbers yourself to sanity
+-check a fresh pull. A >10% swing on the median gets flagged for review,
+since state-level OEWS estimates for a niche occupation are small-sample
+and can move more than you'd expect year to year even when nothing is
+actually wrong.
 
 No API key required -- the BLS public API works unregistered, but is
 rate-limited to 25 queries/day and 25 series per query. Set the
@@ -20,6 +29,7 @@ https://data.bls.gov/registrationEngine/) to raise the limit to 500
 queries/day and 50 series per query.
 """
 
+import json
 import os
 import sys
 import time
@@ -188,25 +198,64 @@ def fetch_wage_data(soc_code, states):
     return rows
 
 
+REVIEW_THRESHOLD_PCT = 10
+
+
+def load_baseline(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)["values"]
+
+
+def apply_baseline(rows, baseline_values):
+    """Annotates each row with its baseline median, % change, and a review
+    flag for swings past REVIEW_THRESHOLD_PCT -- state-level OEWS estimates
+    for a niche occupation are small-sample and can move more than you'd
+    expect year to year even when nothing is actually wrong, so a big swing
+    is worth a second look, not an automatic "this must be broken"."""
+    for row in rows:
+        baseline = baseline_values.get(row.get("geography"))
+        if not baseline or "median" not in baseline or row.get("median") is None:
+            continue
+        row["baseline_median"] = baseline["median"]
+        pct = (row["median"] - baseline["median"]) / baseline["median"] * 100
+        row["pct_change_median"] = round(pct, 1)
+        if abs(pct) > REVIEW_THRESHOLD_PCT:
+            row["review"] = (f"{pct:+.1f}% vs baseline -- larger than typical "
+                              f"annual movement, worth a second look")
+
+
 def save_to_xlsx(rows, soc_code, out_path):
     wb = Workbook()
     ws = wb.active
     ws.title = "BLS Wage Data"
+    has_baseline = any("baseline_median" in row for row in rows)
+
     header = ["Geography", "Region", "Employment", "10th Percentile",
-              "Median", "90th Percentile", "Data Year", "Note"]
+              "Median", "90th Percentile", "Data Year"]
+    if has_baseline:
+        header += ["Baseline Median", "% Change (Median)", "Review"]
+    header.append("Note")
+
     ws.append([f"SOC {soc_code}"])
     ws.append(header)
     for col in range(1, len(header) + 1):
         ws.cell(row=2, column=col).font = Font(bold=True)
 
     for row in rows:
-        ws.append([
+        line = [
             row.get("geography"), row.get("region"), row.get("employment"),
             row.get("10th_pctile"), row.get("median"), row.get("90th_pctile"),
-            row.get("year"), row.get("note"),
-        ])
+            row.get("year"),
+        ]
+        if has_baseline:
+            line += [row.get("baseline_median"), row.get("pct_change_median"), row.get("review")]
+        line.append(row.get("note"))
+        ws.append(line)
 
-    widths = [22, 12, 12, 16, 14, 16, 12, 40]
+    widths = [22, 12, 12, 16, 14, 16, 12]
+    if has_baseline:
+        widths += [16, 18, 45]
+    widths.append(40)
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -214,15 +263,26 @@ def save_to_xlsx(rows, soc_code, out_path):
 
 
 def main():
-    if len(sys.argv) < 3:
-        print('Usage: python fetch_bls_wages.py <SOC-code> "State One,State Two,..." [output.xlsx]')
+    baseline_path = None
+    positional = []
+    for arg in sys.argv[1:]:
+        if arg.startswith("--baseline="):
+            baseline_path = arg.split("=", 1)[1]
+        else:
+            positional.append(arg)
+
+    if len(positional) < 2:
+        print('Usage: python fetch_bls_wages.py <SOC-code> "State One,State Two,..." '
+              '[output.xlsx] [--baseline=path.json]')
         sys.exit(1)
 
-    soc_code = sys.argv[1]
-    states = [s.strip() for s in sys.argv[2].split(",") if s.strip()]
-    out_path = sys.argv[3] if len(sys.argv) > 3 else f"BLS Wage Data - {soc_code}.xlsx"
+    soc_code = positional[0]
+    states = [s.strip() for s in positional[1].split(",") if s.strip()]
+    out_path = positional[2] if len(positional) > 2 else f"BLS Wage Data - {soc_code}.xlsx"
 
     rows = fetch_wage_data(soc_code, states)
+    if baseline_path:
+        apply_baseline(rows, load_baseline(baseline_path))
     save_to_xlsx(rows, soc_code, out_path)
 
     def fmt(value):
@@ -233,6 +293,10 @@ def main():
         line = (f"  {row['geography']:20s} median={fmt(row.get('median'))} "
                 f"10th={fmt(row.get('10th_pctile'))} 90th={fmt(row.get('90th_pctile'))} "
                 f"(employment: {row.get('employment', '?')})")
+        if row.get("pct_change_median") is not None:
+            line += f"  [{row['pct_change_median']:+.1f}% vs baseline]"
+        if row.get("review"):
+            line += f"  ** REVIEW: {row['review']} **"
         if row.get("note"):
             line += f"  [{row['note']}]"
         print(line)
