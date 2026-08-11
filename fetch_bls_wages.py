@@ -1,28 +1,23 @@
 """
 Fetches current BLS OEWS wage data for a given SOC (occupation) code:
-national percentiles plus a region-representative sample of states,
-replicating the documented methodology in
-reference/BME Statistics for Pillar Articles.docx --
+national percentiles plus a fixed, editorially-chosen list of states.
 
-    "we filtered down to OCC code 17-2031 ... and selected a sampling of
-    six states, choosing states that had the highest quantity of
-    employees in the OCC code and represented all regions (W, NE, MW, S)."
-
-Approach: rank all 50 states + DC by employment in the occupation, take
-the top N by employment, then swap in a region's top state if any of the
-4 Census regions is missing from that top-N list (dropping the weakest
-already-covered pick to make room).
+Important: the state list is NOT auto-selected by employment count. Per
+Lydia (2026-08-11), the original states were chosen to represent a
+spectrum of cost of living, not to be the states with the most workers in
+the occupation -- so the state list is always an explicit input here, one
+you (or the pillar's methodology doc) decide, not something this script
+guesses at.
 
 Usage:
-    python fetch_bls_wages.py <SOC-code> [sample_size] [output.xlsx]
-    python fetch_bls_wages.py 17-2031 6 "BME Wage Data.xlsx"
+    python fetch_bls_wages.py <SOC-code> <states-comma-separated> [output.xlsx]
+    python fetch_bls_wages.py 17-2031 "California,Massachusetts,Minnesota,Ohio,Texas,Washington" "BME Wage Data.xlsx"
 
 No API key required -- the BLS public API works unregistered, but is
-rate-limited to 25 queries/day and 25 series per query. A full 51-state
-run alone uses ~9 requests, so it's easy to exhaust that quota during
-iteration/testing. Set the BLS_API_KEY environment variable (free,
-instant registration at https://data.bls.gov/registrationEngine/) to
-raise the limit to 500 queries/day and 50 series per query.
+rate-limited to 25 queries/day and 25 series per query. Set the
+BLS_API_KEY environment variable (free, instant registration at
+https://data.bls.gov/registrationEngine/) to raise the limit to 500
+queries/day and 50 series per query.
 """
 
 import os
@@ -116,56 +111,27 @@ def fetch_series_batch(series_ids):
             data_points = series.get("data", [])
             if data_points:
                 latest = data_points[0]  # BLS returns most recent first
-                results[series["seriesID"]] = (latest["value"], latest["year"])
+                footnote = next(
+                    (f["text"] for f in latest.get("footnotes", []) if f.get("text")), None)
+                results[series["seriesID"]] = (latest["value"], latest["year"], footnote)
         time.sleep(0.5)
     return results
 
 
-def select_representative_states(employment_by_state, sample_size):
-    """Top-N states by employment, with a swap-in if any Census region is
-    unrepresented -- mirrors "highest quantity of employees ... and
-    represented all regions" from the documented methodology."""
-    ranked = sorted(employment_by_state.items(), key=lambda kv: kv[1], reverse=True)
-    selected = [name for name, _ in ranked[:sample_size]]
-
-    all_regions = {"Northeast", "Midwest", "South", "West"}
-    covered = {STATE_INFO[name][1] for name in selected}
-    missing_regions = all_regions - covered
-
-    for region in missing_regions:
-        region_ranked = [name for name, _ in ranked if STATE_INFO[name][1] == region]
-        if not region_ranked:
-            continue
-        best_in_region = region_ranked[0]
-        if best_in_region in selected:
-            continue
-        # Drop the weakest selected state whose region already has
-        # another representative, to make room without losing coverage.
-        region_counts = {}
-        for name in selected:
-            r = STATE_INFO[name][1]
-            region_counts[r] = region_counts.get(r, 0) + 1
-        for name in reversed(selected):  # weakest-employment last
-            if region_counts[STATE_INFO[name][1]] > 1:
-                selected.remove(name)
-                break
-        selected.append(best_in_region)
-
-    return selected
-
-
-def fetch_wage_data(soc_code, sample_size=6):
-    state_names = list(STATE_INFO.keys())
+def fetch_wage_data(soc_code, states):
+    for name in states:
+        if name not in STATE_INFO:
+            raise ValueError(f"Unknown state name: {name!r}")
 
     employment_series = [national_series_id(soc_code, DATATYPE["employment"])]
-    for name in state_names:
+    for name in states:
         employment_series.append(state_series_id(name, soc_code, DATATYPE["employment"]))
 
-    print(f"Fetching employment counts for {len(state_names)} states...")
+    print(f"Fetching employment counts for {len(states)} state(s)...")
     employment_results = fetch_series_batch(employment_series)
 
     employment_by_state = {}
-    for name in state_names:
+    for name in states:
         sid = state_series_id(name, soc_code, DATATYPE["employment"])
         if sid in employment_results:
             value = parse_bls_number(employment_results[sid][0])
@@ -177,13 +143,11 @@ def fetch_wage_data(soc_code, sample_size=6):
     if national_employment_sid in employment_results:
         national_employment = parse_bls_number(employment_results[national_employment_sid][0])
 
-    selected_states = select_representative_states(employment_by_state, sample_size)
-    print(f"Selected states: {', '.join(selected_states)}")
 
     wage_series = []
     for dt_code in (DATATYPE["10th_pctile"], DATATYPE["median"], DATATYPE["90th_pctile"]):
         wage_series.append(national_series_id(soc_code, dt_code))
-    for name in selected_states:
+    for name in states:
         for dt_code in (DATATYPE["10th_pctile"], DATATYPE["median"], DATATYPE["90th_pctile"]):
             wage_series.append(state_series_id(name, soc_code, dt_code))
 
@@ -192,16 +156,19 @@ def fetch_wage_data(soc_code, sample_size=6):
 
     def get_wage(area_series_id_fn, name_or_none):
         row = {}
-        for label, dt_key in (("10th_pctile", "10th_pctile"),
-                               ("median", "median"),
-                               ("90th_pctile", "90th_pctile")):
-            sid = area_series_id_fn(soc_code, DATATYPE[dt_key])
+        notes = []
+        for label in ("10th_pctile", "median", "90th_pctile"):
+            sid = area_series_id_fn(soc_code, DATATYPE[label])
             if sid in wage_results:
-                raw_value, year = wage_results[sid]
+                raw_value, year, footnote = wage_results[sid]
                 value = parse_bls_number(raw_value)
                 if value is not None:
                     row[label] = value
                     row["year"] = year
+                elif footnote:
+                    notes.append(f"{label}: {footnote}")
+        if notes:
+            row["note"] = "; ".join(notes)
         return row
 
     rows = []
@@ -211,7 +178,7 @@ def fetch_wage_data(soc_code, sample_size=6):
     national_row["employment"] = national_employment
     rows.append(national_row)
 
-    for name in selected_states:
+    for name in states:
         row = get_wage(lambda soc, dt, n=name: state_series_id(n, soc, dt), name)
         row["geography"] = name
         row["region"] = STATE_INFO[name][1]
@@ -226,7 +193,7 @@ def save_to_xlsx(rows, soc_code, out_path):
     ws = wb.active
     ws.title = "BLS Wage Data"
     header = ["Geography", "Region", "Employment", "10th Percentile",
-              "Median", "90th Percentile", "Data Year"]
+              "Median", "90th Percentile", "Data Year", "Note"]
     ws.append([f"SOC {soc_code}"])
     ws.append(header)
     for col in range(1, len(header) + 1):
@@ -236,10 +203,10 @@ def save_to_xlsx(rows, soc_code, out_path):
         ws.append([
             row.get("geography"), row.get("region"), row.get("employment"),
             row.get("10th_pctile"), row.get("median"), row.get("90th_pctile"),
-            row.get("year"),
+            row.get("year"), row.get("note"),
         ])
 
-    widths = [22, 12, 12, 16, 14, 16, 12]
+    widths = [22, 12, 12, 16, 14, 16, 12, 40]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -247,15 +214,15 @@ def save_to_xlsx(rows, soc_code, out_path):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python fetch_bls_wages.py <SOC-code> [sample_size] [output.xlsx]")
+    if len(sys.argv) < 3:
+        print('Usage: python fetch_bls_wages.py <SOC-code> "State One,State Two,..." [output.xlsx]')
         sys.exit(1)
 
     soc_code = sys.argv[1]
-    sample_size = int(sys.argv[2]) if len(sys.argv) > 2 else 6
+    states = [s.strip() for s in sys.argv[2].split(",") if s.strip()]
     out_path = sys.argv[3] if len(sys.argv) > 3 else f"BLS Wage Data - {soc_code}.xlsx"
 
-    rows = fetch_wage_data(soc_code, sample_size)
+    rows = fetch_wage_data(soc_code, states)
     save_to_xlsx(rows, soc_code, out_path)
 
     def fmt(value):
@@ -263,9 +230,12 @@ def main():
 
     print(f"\nDone. Saved {len(rows)} row(s) to {out_path}")
     for row in rows:
-        print(f"  {row['geography']:20s} median={fmt(row.get('median'))} "
-              f"10th={fmt(row.get('10th_pctile'))} 90th={fmt(row.get('90th_pctile'))} "
-              f"(employment: {row.get('employment', '?')})")
+        line = (f"  {row['geography']:20s} median={fmt(row.get('median'))} "
+                f"10th={fmt(row.get('10th_pctile'))} 90th={fmt(row.get('90th_pctile'))} "
+                f"(employment: {row.get('employment', '?')})")
+        if row.get("note"):
+            line += f"  [{row['note']}]"
+        print(line)
 
 
 if __name__ == "__main__":
