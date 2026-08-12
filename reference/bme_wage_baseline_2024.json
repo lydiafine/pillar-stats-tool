@@ -8,6 +8,7 @@
     "Minnesota": {"10th_pctile": 83440, "median": 124760, "90th_pctile": 184510},
     "Ohio": {"10th_pctile": 79140, "median": 117960, "90th_pctile": 165570},
     "Texas": {"10th_pctile": 54840, "median": 97160, "90th_pctile": 151330},
-    "Washington": {"10th_pctile": 64510, "median": 125010, "90th_pctile": 182250}
+    "Washington": {"10th_pctile": 64510, "median": 125010, "90th_pctile": 182250},
+    "Iowa": {"median": 91760, "_note": "Not from the methodology doc's 6-state table -- cited inline in the 'how-much-money-does-a-biomedical-engineer-make' article's Iowa City cost-of-living comparison. No explicit year given in that sentence, and no 10th/90th percentile were cited alongside it."}
   }
 }
