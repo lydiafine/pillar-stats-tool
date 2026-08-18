@@ -1,3 +1,4 @@
 *.xlsx
 !reference/*.xlsx
 __pycache__/
+.bls_api_key
