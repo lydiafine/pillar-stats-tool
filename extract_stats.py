@@ -132,24 +132,38 @@ def suggested_cadence(source_label):
     return "Review"
 
 
-def latest_bls_wage_year(today=None):
-    # BLS OEWS publishes new annual wage estimates each spring (historically
-    # ~April), covering May-of-prior-year data. Heuristic, not a live check
-    # of BLS's release calendar.
-    today = today or date.today()
-    return today.year - 1 if today.month >= 4 else today.year - 2
-
+# Release cadences below are transcribed from the authoritative schedule
+# Lydia provided: reference/IPEDS and BLS Data Refresh Cadence.xlsx. If she
+# sends an updated version of that file, re-derive these functions against
+# its rows rather than assuming the pattern still holds indefinitely.
 
 def latest_ipeds_completions_year(today=None):
-    # IPEDS Completions data for academic year YYYY-(YY+1) is broadly
-    # available roughly mid-the-following-year. Heuristic, not a live check
-    # of IPEDS's release calendar. Year returned is the academic year's
-    # *start* year (matches how these articles cite it, e.g. "2023-24").
+    # Institutional Characteristics / Completions / 12-month Enrollment for
+    # academic year Y-(Y+1) releases June 1 of Y+2 (e.g. "23-24" -> Jun 1
+    # 2025, per the reference doc's RELEASES sheet).
     today = today or date.today()
-    return today.year - 1 if today.month >= 7 else today.year - 2
+    cutoff_year = today.year - 2
+    return cutoff_year if today >= date(today.year, 6, 1) else cutoff_year - 1
 
 
-def assess_staleness(source_label, years_str, today=None):
+def latest_bls_oews_year(today=None):
+    # Occupational Employment and Wage Statistics for year Y releases May 1
+    # of that same year Y (per the reference doc -- not the "following
+    # spring" timing generally associated with OEWS; deferring to Lydia's
+    # sheet since it's the authoritative source for this project).
+    today = today or date.today()
+    return today.year if today >= date(today.year, 5, 1) else today.year - 1
+
+
+def latest_bls_projection_start_year(today=None):
+    # Occupational (10-year) Projections starting year Y (e.g. "2024-2034")
+    # release "late August" of Y+1; approximated here as August 25.
+    today = today or date.today()
+    cutoff_year = today.year - 1
+    return cutoff_year if today >= date(today.year, 8, 25) else cutoff_year - 1
+
+
+def assess_staleness(source_label, years_str, stat_type="", today=None):
     if source_label == "Unknown (needs review)":
         return "Source unclear — manual check"
     if source_label not in ("BLS", "IPEDS"):
@@ -165,18 +179,32 @@ def assess_staleness(source_label, years_str, today=None):
     if not year_ints:
         return "No year found — manual check"
 
-    cited_year = max(year_ints)
-    latest_expected = (
-        latest_bls_wage_year(today) if source_label == "BLS"
-        else latest_ipeds_completions_year(today)
-    )
+    if source_label == "IPEDS":
+        # Our observed IPEDS citations on this site are all completions-based
+        # (college-comparison tables); IPEDS's other components (admissions/
+        # grad rates, fall enrollment/finance) have different release dates
+        # in the reference doc that aren't wired in here yet.
+        cited_year = max(year_ints)
+        latest_expected = latest_ipeds_completions_year(today)
+        cadence_note = "IPEDS completions"
+    elif stat_type == "Outlook" and len(year_ints) >= 2 and max(year_ints) - min(year_ints) >= 5:
+        # A 10-year projection range like "2024 to 2034" -- compare the
+        # *start* year against the projection release cadence, not the
+        # far-off end year.
+        cited_year = min(year_ints)
+        latest_expected = latest_bls_projection_start_year(today)
+        cadence_note = "BLS occupational projections"
+    else:
+        cited_year = max(year_ints)
+        latest_expected = latest_bls_oews_year(today)
+        cadence_note = "BLS OEWS wage data"
 
     if cited_year < latest_expected:
         return (f"Likely stale — article cites {cited_year}, "
-                f"~{latest_expected} data should now be available")
+                f"~{latest_expected} {cadence_note} should now be available")
     if cited_year == latest_expected:
-        return "Current — matches latest expected release"
-    return "Current — cites data newer than heuristic expects (verify)"
+        return f"Current — matches latest expected {cadence_note} release"
+    return f"Current — cites {cadence_note} newer than heuristic expects (verify)"
 
 
 def is_noise(el):
@@ -599,7 +627,7 @@ def write_stat_group(ws, pillar_name, row):
     vertically across those rows so the group still reads as one entry.
     Returns True if this stat is likely stale."""
     stat_name = row["stat_name"]
-    staleness = assess_staleness(row["source"], row["years"])
+    staleness = assess_staleness(row["source"], row["years"], row["stat_type"])
     shared = [pillar_name, stat_name, row["block_type"], row["quote"],
               row["years"], row["source"], row["stat_type"],
               suggested_cadence(row["source"]), staleness]
