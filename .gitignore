@@ -2,3 +2,4 @@
 !reference/*.xlsx
 __pycache__/
 .bls_api_key
+.cs_api_key
