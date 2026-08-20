@@ -1,8 +1,8 @@
 {
-  "_source": "BME Statistics for Pillar Articles.docx -- College Scorecard, published July 2025",
+  "_source": "BME Statistics for Pillar Articles.docx -- College Scorecard, AUG 2026 UPDATE table (fetched via fetch_college_scorecard.py, independently verified by Lydia against raw data)",
   "cip_code": "1405",
   "values": {
-    "Bachelor's": {"earn_1yr": 54518, "earn_5yr": 96582, "debt": 22503},
-    "Master's": {"earn_1yr": 70941, "earn_5yr": 109387, "debt": null}
+    "Bachelor's": {"earn_1yr": 63858, "earn_5yr": 94925, "debt": 22991},
+    "Master's": {"earn_1yr": 78984, "earn_5yr": 109612, "debt": null}
   }
 }
