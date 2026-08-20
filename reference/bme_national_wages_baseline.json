@@ -1,0 +1,12 @@
+{
+  "_source": "First pull 2026-08-20, via fetch_bls_national_wages.py -- BLS OEWS 2025 data. No prior exact baseline existed for the physician set: the article only cited loose thresholds (\"$200,000 or more\", \"$300,000+\"), not specific figures. The All Occupations benchmark DOES have a prior published figure ($49,500, cited in 4 articles) -- that's recorded as its baseline below.",
+  "_context": "Supports two BME pillar stats: (1) the physician/surgeon pay-range sentence in 'Can you get into med school with a biomedical engineering degree?' (general practitioners $200,000+, surgeons/anesthesiologists $300,000+); (2) the 'median salary for all U.S. occupations, which hovers around $49,500' comparison line appearing in 4 different articles.",
+  "values": {
+    "Family Medicine Physicians": {"median": 244180},
+    "General Internal Medicine Physicians": {"median": 256560},
+    "Pediatricians General": {"median": 210040},
+    "Surgeons All Other": {"median": 414010},
+    "Anesthesiologists": {"median": 391490},
+    "All Occupations (National Benchmark)": {"median": 49500}
+  }
+}
